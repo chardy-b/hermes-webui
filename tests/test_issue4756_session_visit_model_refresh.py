@@ -6,10 +6,35 @@ import io
 import json
 import os
 import time
+import threading
 from pathlib import Path
 from urllib.parse import urlparse
 
+import pytest
+
 REPO = Path(__file__).resolve().parent.parent
+
+
+@pytest.fixture(autouse=True)
+def _fresh_session_visit_refresh_lock(monkeypatch):
+    """Give every test its own session-visit revalidation lock.
+
+    Owner of the real lock is api.config (module state); without this reset a
+    previous test's still-held lock would make later tests silently skip the
+    background refresh and pass for the wrong reason.
+    """
+    import api.config as cfg
+
+    monkeypatch.setattr(cfg, "_session_visit_refresh_lock", threading.Lock(), raising=False)
+
+
+def _wait_for_background_refresh_done(cfg, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not cfg._session_visit_refresh_lock.locked():
+            return True
+        time.sleep(0.01)
+    return False
 
 
 def _catalog(label: str) -> dict:
@@ -85,11 +110,19 @@ def test_session_visit_ignores_recently_warmed_memory_when_disk_cache_is_stale(t
 
     def _live_rebuild(**kwargs):
         calls.append(kwargs)
+        rebuild_started.set()
         return rebuilt_catalog
 
     monkeypatch.setattr(cfg, "get_available_models", _live_rebuild)
 
-    assert cfg.get_available_models_for_session_visit() == rebuilt_catalog
+    rebuild_started = threading.Event()
+    # Disk staleness still wins over the recently warmed memory cache: the
+    # stale catalog is served immediately and revalidation happens in the
+    # background.
+    result = cfg.get_available_models_for_session_visit()
+    assert result == stale_catalog
+    assert rebuild_started.wait(timeout=5)
+    assert _wait_for_background_refresh_done(cfg)
     assert calls == [{"force_refresh": True}]
 
 
@@ -104,6 +137,8 @@ def test_session_visit_stale_profile_cache_revalidates_with_live_rebuild(tmp_pat
     old = time.time() - 600.0
     os.utime(cache_path, (old, old))
     calls = []
+    rebuild_started = threading.Event()
+    release_rebuild = threading.Event()
 
     monkeypatch.setattr(cfg, "_SESSION_VISIT_MODELS_FRESHNESS_SECONDS", 300.0, raising=False)
     monkeypatch.setattr(cfg, "_get_models_cache_path", lambda: cache_path)
@@ -112,69 +147,63 @@ def test_session_visit_stale_profile_cache_revalidates_with_live_rebuild(tmp_pat
 
     def _live_rebuild(**kwargs):
         calls.append(kwargs)
+        rebuild_started.set()
+        assert release_rebuild.wait(timeout=5)
         return rebuilt_catalog
 
     monkeypatch.setattr(cfg, "get_available_models", _live_rebuild)
 
-    assert cfg.get_available_models_for_session_visit() == rebuilt_catalog
+    # Stale-while-revalidate: the visit returns the stale catalog WITHOUT
+    # waiting for the (here indefinitely blocked) live rebuild.
+    result = cfg.get_available_models_for_session_visit()
+    assert result == stale_catalog
+    assert rebuild_started.wait(timeout=5), "background revalidation must start"
+    release_rebuild.set()
+    assert _wait_for_background_refresh_done(cfg)
     assert calls == [{"force_refresh": True}]
 
 
 def test_session_visit_overlapping_stale_calls_coalesce_to_single_live_rebuild(tmp_path, monkeypatch):
     import api.config as cfg
-    import threading
     from concurrent.futures import ThreadPoolExecutor
 
     _reset_models_memory_cache(monkeypatch)
     stale_catalog = _catalog("stale-model")
     rebuilt_catalog = _catalog("rebuilt-model")
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text("{}", encoding="utf-8")
     cache_path = tmp_path / "models_cache.profile.json"
     cache_path.write_text("{}", encoding="utf-8")
     old = time.time() - 600.0
     os.utime(cache_path, (old, old))
-    fingerprint = {"profile": "demo"}
-    stale_load_counts = {}
-    stale_load_lock = threading.Lock()
-    second_load_gate = threading.Barrier(2)
-    rebuild_count = 0
-    rebuild_lock = threading.Lock()
+    calls = []
+    calls_lock = threading.Lock()
+    rebuild_started = threading.Event()
+    release_rebuild = threading.Event()
 
     monkeypatch.setattr(cfg, "_SESSION_VISIT_MODELS_FRESHNESS_SECONDS", 300.0, raising=False)
-    monkeypatch.setattr(cfg, "_LIVE_REBUILD_BUDGET_SECONDS", 0.0, raising=False)
-    monkeypatch.setattr(cfg, "_get_config_path", lambda: config_path)
-    monkeypatch.setattr(cfg, "_cfg_path", config_path, raising=False)
-    monkeypatch.setattr(cfg, "_cfg_mtime", config_path.stat().st_mtime, raising=False)
     monkeypatch.setattr(cfg, "_get_models_cache_path", lambda: cache_path)
-    monkeypatch.setattr(cfg, "_load_models_cache_from_disk", lambda: None)
-    monkeypatch.setattr(cfg, "_models_cache_source_fingerprint", lambda: fingerprint)
-    monkeypatch.setattr(cfg, "_save_models_cache_to_disk", lambda _cache: None)
+    monkeypatch.setattr(cfg, "_load_models_cache_from_disk", lambda: stale_catalog)
+    monkeypatch.setattr(cfg, "_load_stale_models_cache_from_disk", lambda: stale_catalog)
 
-    def _load_stale_models_cache_from_disk():
-        ident = threading.get_ident()
-        with stale_load_lock:
-            count = stale_load_counts.get(ident, 0) + 1
-            stale_load_counts[ident] = count
-        if count == 2:
-            second_load_gate.wait(timeout=5)
-        return stale_catalog
-
-    def _invoke_models_rebuild(_builder):
-        nonlocal rebuild_count
-        with rebuild_lock:
-            rebuild_count += 1
+    def _live_rebuild(**kwargs):
+        with calls_lock:
+            calls.append(kwargs)
+        rebuild_started.set()
+        assert release_rebuild.wait(timeout=5)
         return rebuilt_catalog
 
-    monkeypatch.setattr(cfg, "_load_stale_models_cache_from_disk", _load_stale_models_cache_from_disk)
-    monkeypatch.setattr(cfg, "_invoke_models_rebuild", _invoke_models_rebuild)
+    monkeypatch.setattr(cfg, "get_available_models", _live_rebuild)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         futures = [executor.submit(cfg.get_available_models_for_session_visit) for _ in range(2)]
         results = [future.result(timeout=10) for future in futures]
 
-    assert all(result == rebuilt_catalog for result in results)
-    assert rebuild_count == 1
+    # Every stale visit is answered immediately from the stale catalog...
+    assert all(result == stale_catalog for result in results)
+    # ...and the blocked rebuild was started by exactly one visit.
+    assert rebuild_started.wait(timeout=5)
+    release_rebuild.set()
+    assert _wait_for_background_refresh_done(cfg)
+    assert calls == [{"force_refresh": True}]
 
 
 def test_force_refresh_sync_followers_wait_past_legacy_timeout(tmp_path, monkeypatch):
@@ -336,133 +365,86 @@ def test_force_refresh_bounded_followers_wait_only_remaining_budget(tmp_path, mo
     assert elapsed < 0.1
 
 
-def test_session_visit_overlapping_stale_calls_do_not_duplicate_over_budget_rebuild(tmp_path, monkeypatch):
+def test_session_visit_repeated_stale_calls_do_not_spawn_duplicate_refreshes(tmp_path, monkeypatch):
     import api.config as cfg
-    import threading
-    from concurrent.futures import ThreadPoolExecutor
 
     _reset_models_memory_cache(monkeypatch)
     stale_catalog = _catalog("stale-model")
     rebuilt_catalog = _catalog("rebuilt-model")
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text("{}", encoding="utf-8")
     cache_path = tmp_path / "models_cache.profile.json"
     cache_path.write_text("{}", encoding="utf-8")
     old = time.time() - 600.0
     os.utime(cache_path, (old, old))
-    fingerprint = {"profile": "demo"}
-    stale_load_counts = {}
-    stale_load_lock = threading.Lock()
-    second_load_gate = threading.Barrier(2)
-    rebuild_count = 0
-    rebuild_lock = threading.Lock()
+    calls = []
+    calls_lock = threading.Lock()
+    rebuild_started = threading.Event()
+    release_rebuild = threading.Event()
 
     monkeypatch.setattr(cfg, "_SESSION_VISIT_MODELS_FRESHNESS_SECONDS", 300.0, raising=False)
-    monkeypatch.setattr(cfg, "_LIVE_REBUILD_BUDGET_SECONDS", 0.01, raising=False)
-    monkeypatch.setattr(cfg, "_get_config_path", lambda: config_path)
-    monkeypatch.setattr(cfg, "_cfg_path", config_path, raising=False)
-    monkeypatch.setattr(cfg, "_cfg_mtime", config_path.stat().st_mtime, raising=False)
     monkeypatch.setattr(cfg, "_get_models_cache_path", lambda: cache_path)
-    monkeypatch.setattr(cfg, "_load_models_cache_from_disk", lambda: None)
-    monkeypatch.setattr(cfg, "_models_cache_source_fingerprint", lambda: fingerprint)
-    monkeypatch.setattr(cfg, "_save_models_cache_to_disk", lambda _cache: None)
+    monkeypatch.setattr(cfg, "_load_models_cache_from_disk", lambda: stale_catalog)
+    monkeypatch.setattr(cfg, "_load_stale_models_cache_from_disk", lambda: stale_catalog)
 
-    def _load_stale_models_cache_from_disk():
-        ident = threading.get_ident()
-        with stale_load_lock:
-            count = stale_load_counts.get(ident, 0) + 1
-            stale_load_counts[ident] = count
-        if count == 2:
-            second_load_gate.wait(timeout=5)
-        return stale_catalog
-
-    def _invoke_models_rebuild(_builder):
-        nonlocal rebuild_count
-        with rebuild_lock:
-            rebuild_count += 1
-        time.sleep(0.05)
+    def _live_rebuild(**kwargs):
+        with calls_lock:
+            calls.append(kwargs)
+        rebuild_started.set()
+        assert release_rebuild.wait(timeout=5)
         return rebuilt_catalog
 
-    monkeypatch.setattr(cfg, "_load_stale_models_cache_from_disk", _load_stale_models_cache_from_disk)
-    monkeypatch.setattr(cfg, "_invoke_models_rebuild", _invoke_models_rebuild)
+    monkeypatch.setattr(cfg, "get_available_models", _live_rebuild)
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = [executor.submit(cfg.get_available_models_for_session_visit) for _ in range(2)]
-        results = [future.result(timeout=10) for future in futures]
+    first = cfg.get_available_models_for_session_visit()
+    assert first == stale_catalog
+    assert rebuild_started.wait(timeout=5)
 
-    assert all(result == stale_catalog for result in results)
-    assert rebuild_count == 1
-    time.sleep(0.1)
-    assert cfg._available_models_cache == rebuilt_catalog
-    assert cfg._cache_build_in_progress is False
+    # While one revalidation is in flight, further stale visits return the
+    # stale catalog without spawning another refresh.
+    second = cfg.get_available_models_for_session_visit()
+    assert second == stale_catalog
+
+    release_rebuild.set()
+    assert _wait_for_background_refresh_done(cfg)
+    assert calls == [{"force_refresh": True}]
 
 
 def test_session_visit_force_refresh_ignores_plain_disk_publish_started_after_refresh(tmp_path, monkeypatch):
     import api.config as cfg
-    import threading
-    from concurrent.futures import ThreadPoolExecutor
 
     _reset_models_memory_cache(monkeypatch)
     stale_catalog = _catalog("stale-model")
     rebuilt_catalog = _catalog("rebuilt-model")
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text("{}", encoding="utf-8")
     cache_path = tmp_path / "models_cache.profile.json"
     cache_path.write_text("{}", encoding="utf-8")
     old = time.time() - 600.0
     os.utime(cache_path, (old, old))
-    fingerprint = {"profile": "demo"}
-    stale_load_counts = {}
-    stale_load_lock = threading.Lock()
-    force_refresh_waiting = threading.Event()
-    plain_publish_done = threading.Event()
-    rebuild_count = 0
-    rebuild_lock = threading.Lock()
+    rebuild_started = threading.Event()
+    release_rebuild = threading.Event()
 
     monkeypatch.setattr(cfg, "_SESSION_VISIT_MODELS_FRESHNESS_SECONDS", 300.0, raising=False)
-    monkeypatch.setattr(cfg, "_LIVE_REBUILD_BUDGET_SECONDS", 0.0, raising=False)
-    monkeypatch.setattr(cfg, "_get_config_path", lambda: config_path)
-    monkeypatch.setattr(cfg, "_cfg_path", config_path, raising=False)
-    monkeypatch.setattr(cfg, "_cfg_mtime", config_path.stat().st_mtime, raising=False)
     monkeypatch.setattr(cfg, "_get_models_cache_path", lambda: cache_path)
     monkeypatch.setattr(cfg, "_load_models_cache_from_disk", lambda: stale_catalog)
-    monkeypatch.setattr(cfg, "_models_cache_source_fingerprint", lambda: fingerprint)
-    monkeypatch.setattr(cfg, "_save_models_cache_to_disk", lambda _cache: None)
+    monkeypatch.setattr(cfg, "_load_stale_models_cache_from_disk", lambda: stale_catalog)
 
-    def _load_stale_models_cache_from_disk():
-        ident = threading.get_ident()
-        with stale_load_lock:
-            count = stale_load_counts.get(ident, 0) + 1
-            stale_load_counts[ident] = count
-        if count == 2:
-            force_refresh_waiting.set()
-            assert plain_publish_done.wait(timeout=5)
-        return stale_catalog
-
-    def _invoke_models_rebuild(_builder):
-        nonlocal rebuild_count
-        with rebuild_lock:
-            rebuild_count += 1
+    def _live_rebuild(**kwargs):
+        if kwargs.get("force_refresh"):
+            rebuild_started.set()
+            assert release_rebuild.wait(timeout=5)
         return rebuilt_catalog
 
-    def _plain_disk_hit():
-        result = cfg.get_available_models()
-        plain_publish_done.set()
-        return result
+    monkeypatch.setattr(cfg, "get_available_models", _live_rebuild)
 
-    monkeypatch.setattr(cfg, "_load_stale_models_cache_from_disk", _load_stale_models_cache_from_disk)
-    monkeypatch.setattr(cfg, "_invoke_models_rebuild", _invoke_models_rebuild)
+    # The background revalidation must not block a plain caller.
+    assert cfg.get_available_models_for_session_visit() == stale_catalog
+    assert rebuild_started.wait(timeout=5)
+    started = time.monotonic()
+    plain_result = cfg.get_available_models()
+    elapsed = time.monotonic() - started
+    assert plain_result == rebuilt_catalog
+    assert elapsed < 2.0, "plain caller must not wait on the in-flight revalidation"
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        refresh_future = executor.submit(cfg.get_available_models_for_session_visit)
-        assert force_refresh_waiting.wait(timeout=5)
-        plain_result = executor.submit(_plain_disk_hit).result(timeout=10)
-        refresh_result = refresh_future.result(timeout=10)
-
-    assert plain_result == stale_catalog
-    assert refresh_result == rebuilt_catalog
-    assert rebuild_count == 1
-    assert cfg._available_models_cache == rebuilt_catalog
+    release_rebuild.set()
+    assert _wait_for_background_refresh_done(cfg)
 
 
 def test_session_visit_fresh_disk_hit_does_not_overwrite_newer_memory_cache(tmp_path, monkeypatch):
@@ -561,7 +543,10 @@ def test_default_disk_hit_does_not_restamp_stale_cache_for_session_visit(tmp_pat
 
     monkeypatch.setattr(cfg, "get_available_models", _live_rebuild)
 
-    assert cfg.get_available_models_for_session_visit() == rebuilt_catalog
+    # Stale-while-revalidate: the stale disk catalog is served without a
+    # blocking rebuild, and the plain disk hit above never rewrote the file.
+    assert cfg.get_available_models_for_session_visit() == stale_catalog
+    assert _wait_for_background_refresh_done(cfg)
     assert refresh_calls == [{"force_refresh": True}]
 
 
@@ -574,6 +559,7 @@ def test_session_visit_live_rebuild_failure_falls_back_to_cached_catalog(tmp_pat
     cache_path.write_text("{}", encoding="utf-8")
     old = time.time() - 600.0
     os.utime(cache_path, (old, old))
+    rebuild_started = threading.Event()
 
     monkeypatch.setattr(cfg, "_SESSION_VISIT_MODELS_FRESHNESS_SECONDS", 300.0, raising=False)
     monkeypatch.setattr(cfg, "_get_models_cache_path", lambda: cache_path)
@@ -582,11 +568,35 @@ def test_session_visit_live_rebuild_failure_falls_back_to_cached_catalog(tmp_pat
 
     def _failing_live_rebuild(**kwargs):
         assert kwargs == {"force_refresh": True}
+        rebuild_started.set()
         raise RuntimeError("provider unavailable")
 
     monkeypatch.setattr(cfg, "get_available_models", _failing_live_rebuild)
 
+    # The visit itself returns the stale catalog; the failing refresh runs in
+    # the background and must never propagate to the request thread.
     assert cfg.get_available_models_for_session_visit() == stale_catalog
+    assert rebuild_started.wait(timeout=5)
+    assert _wait_for_background_refresh_done(cfg), "lock must release after a failed refresh"
+
+
+def test_session_visit_freshness_env_override_clamps_and_falls_back(monkeypatch):
+    import api.config as cfg
+
+    monkeypatch.setattr(cfg, "_SESSION_VISIT_MODELS_FRESHNESS_SECONDS", 300.0, raising=False)
+    monkeypatch.delenv("HERMES_WEBUI_MODELS_FRESHNESS_SECONDS", raising=False)
+    assert cfg._session_visit_models_freshness_seconds() == 300.0
+
+    for raw, expected in [
+        ("invalid", 300.0),
+        ("", 300.0),
+        ("   ", 300.0),
+        ("30", 60.0),
+        ("99999", 7200.0),
+        ("1800", 1800.0),
+    ]:
+        monkeypatch.setenv("HERMES_WEBUI_MODELS_FRESHNESS_SECONDS", raw)
+        assert cfg._session_visit_models_freshness_seconds() == expected, raw
 
 
 class _FakeHandler:

@@ -211,6 +211,22 @@ For a foreground `python3 bootstrap.py`, stop it with Ctrl-C and start it again.
 
 ---
 
+## Slow first chat-list load after idle periods
+
+**Symptom:** The sidebar/chat list takes several seconds to appear after the UI has been idle, while repeat loads are fast.
+
+**Why:** Each session visit revalidates the model catalog. Historically, when the models cache was older than the freshness TTL, the visit synchronously rebuilt the catalog (live provider probes) before responding.
+
+**Fix (current behavior):** The visit returns the last-known-good catalog immediately and revalidates in a background thread, so the chat list is not blocked. Tune the freshness window with:
+
+```bash
+# Seconds before a session visit considers the models cache stale.
+# Default 900; values are clamped to [60, 7200]; invalid values fall back to the default.
+HERMES_WEBUI_MODELS_FRESHNESS_SECONDS=1800
+```
+
+**When to file a bug:** If the chat list still blocks on a model rebuild (look for `models.session_visit` slow-log lines whose total equals the request latency), that is a regression — file it with the slow-log line.
+
 ## Other troubleshooting
 
 This document grows over time. If a recurring failure mode isn't covered here yet, add it via PR. The format for each entry: **Symptom → Why → Diagnostic commands → Fix → When to file a bug**.

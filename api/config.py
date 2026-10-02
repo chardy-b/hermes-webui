@@ -5202,7 +5202,16 @@ _available_models_cache_ts: float = 0.0
 _available_models_live_rebuild_ts: float = 0.0
 _available_models_cache_source_fingerprint: dict | None = None
 _AVAILABLE_MODELS_CACHE_TTL: float = 86400.0  # 24 hours
-_SESSION_VISIT_MODELS_FRESHNESS_SECONDS: float = 300.0
+_SESSION_VISIT_MODELS_FRESHNESS_SECONDS: float = 900.0
+_SESSION_VISIT_MODELS_FRESHNESS_MIN: float = 60.0
+_SESSION_VISIT_MODELS_FRESHNESS_MAX: float = 7200.0
+# Owner: api.config (this module). This plain Lock guards ONLY the
+# session-visit background revalidation below — one in-flight background
+# force-refresh at a time. It is separate from _available_models_cache_lock
+# (the RLock that owns the cache data itself) so a refresh running in the
+# background never holds the data lock while blocking on the network;
+# background cache mutations still go through _available_models_cache_lock.
+_session_visit_refresh_lock = threading.Lock()
 _available_models_cache_lock = threading.RLock()  # must be RLock: cold path refactoring moved slow work inside this lock, requiring re-entry
 _cache_build_cv = threading.Condition(_available_models_cache_lock)  # shares underlying RLock so notify_all() is safe inside with _available_models_cache_lock
 _cache_build_in_progress = False  # True while a cold path is actively building
@@ -8865,6 +8874,51 @@ def warm_models_catalog_provenance_if_cold() -> None:
         _available_models_cache_lock.release()
 
 
+def _session_visit_models_freshness_seconds() -> float:
+    """Resolve the session-visit models freshness TTL.
+
+    Owner: api.config. The base value is the module constant
+    ``_SESSION_VISIT_MODELS_FRESHNESS_SECONDS`` (the single authority tests
+    monkeypatch); the optional env override
+    ``HERMES_WEBUI_MODELS_FRESHNESS_SECONDS`` (seconds) is clamped to
+    [60, 7200]. Any missing/empty/non-numeric value falls back to the
+    constant — a malformed env value can never disable freshness checking.
+    """
+    raw = (os.environ.get("HERMES_WEBUI_MODELS_FRESHNESS_SECONDS", "") or "").strip()
+    value = _SESSION_VISIT_MODELS_FRESHNESS_SECONDS
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            value = _SESSION_VISIT_MODELS_FRESHNESS_SECONDS
+    return max(
+        _SESSION_VISIT_MODELS_FRESHNESS_MIN,
+        min(_SESSION_VISIT_MODELS_FRESHNESS_MAX, value),
+    )
+
+
+def _session_visit_background_refresh(stale_cached: dict) -> None:
+    """Revalidate the session-visit models cache in a daemon thread.
+
+    Owner: api.config. Started at most once at a time (guarded by
+    ``_session_visit_refresh_lock``, which this function releases when the
+    attempt ends so the next stale visit can revalidate); runs
+    ``get_available_models(force_refresh=True)``, which owns updating the
+    memory + disk cache through ``_available_models_cache_lock``. Failures
+    are logged and leave the stale cache intact; nothing propagates to the
+    request thread.
+    """
+    try:
+        get_available_models(force_refresh=True)
+    except Exception:
+        logger.debug(
+            "session-visit background models refresh failed; stale cache left intact",
+            exc_info=True,
+        )
+    finally:
+        _session_visit_refresh_lock.release()
+
+
 def get_available_models_for_session_visit() -> dict:
     """Return /api/models with a short session-visit freshness horizon.
 
@@ -8899,7 +8953,8 @@ def get_available_models_for_session_visit() -> dict:
     cache_age = _models_cache_file_age_seconds(cache_path, time.time())
     _mark(f"disk_age_check:{cache_age}")
     disk_cached = None
-    if cache_age is not None and cache_age < _SESSION_VISIT_MODELS_FRESHNESS_SECONDS:
+    _freshness = _session_visit_models_freshness_seconds()
+    if cache_age is not None and cache_age < _freshness:
         _mark("cache_age_within_ttl")
         now_mono = time.monotonic()
         with _available_models_cache_lock:
@@ -8928,6 +8983,33 @@ def get_available_models_for_session_visit() -> dict:
     _mark("cache_age_stale_or_missing")
     stale_cached = disk_cached or _load_stale_models_cache_from_disk()
     _mark(f"stale_cached_loaded:{bool(stale_cached)}")
+    if stale_cached is not None:
+        # perf(session-load-latency) stale-while-revalidate: the request never
+        # waits on the live provider rebuild. Serve the stale catalog now and
+        # revalidate in a daemon thread (at most one in flight, guarded by
+        # _session_visit_refresh_lock). The refresh owns updating the memory
+        # + disk cache via _available_models_cache_lock, so the next visit
+        # sees fresh data. This mirrors prefer_cache fallback semantics: the
+        # served value is the same last-known-good catalog that the old
+        # force-refresh-failure path returned — the only change is that a
+        # healthy refresh no longer blocks the caller.
+        _mark("stale_served_refresh_deferred")
+        acquired = _session_visit_refresh_lock.acquire(blocking=False)
+        if acquired:
+            try:
+                threading.Thread(
+                    target=_session_visit_background_refresh,
+                    args=(stale_cached,),
+                    name="session-visit-models-revalidate",
+                    daemon=True,
+                ).start()
+            except Exception:
+                _session_visit_refresh_lock.release()
+                logger.debug("failed to start session-visit background refresh", exc_info=True)
+        else:
+            _mark("refresh_already_in_flight")
+        _maybe_log_slow_stages(_logger, _stagelog, _slow_threshold_ms, "models.session_visit")
+        return copy.deepcopy(stale_cached)
     try:
         _mark("force_refresh_start")
         result = get_available_models(force_refresh=True)
