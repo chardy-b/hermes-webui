@@ -272,17 +272,53 @@ def _python_can_run_webui_and_agent(python_exe: str, agent_dir: Path | None = No
     return check.returncode == 0
 
 
+def _uses_explicit_webui_runtime(agent_dir: Path | None) -> bool:
+    """Return whether bootstrap owns a separate POSIX source-backed runtime."""
+    return (
+        platform.system() != "Windows"
+        and agent_dir is not None
+        and bool(os.getenv("HERMES_WEBUI_PYTHON", "").strip())
+    )
+
+
+def _prepare_explicit_webui_runtime(agent_dir: Path | None) -> None:
+    """Keep an explicitly selected POSIX WebUI runtime in-process.
+
+    Current Hermes source installs may lazily re-exec ``run_agent`` with their
+    project-managed Python.  That is useful for the CLI, but it breaks the
+    WebUI's interpreter contract when ``HERMES_WEBUI_PYTHON`` deliberately
+    selects a separate environment (for example WebUI Python 3.12 beside an
+    Agent PM Python 3.14).  Disable that re-exec only for this explicit,
+    source-backed bootstrap path.  Direct ``server.py`` launches, automatic
+    interpreter selection, explicit operator overrides, and native Windows keep
+    their existing behavior.
+    """
+    if _uses_explicit_webui_runtime(agent_dir):
+        os.environ.setdefault("HERMES_DISABLE_LAZY_INSTALLS", "1")
+
+
 def ensure_python_has_webui_deps(python_exe: str, agent_dir: Path | None = None) -> str:
     """Return a Python executable that can run both WebUI and Hermes Agent.
 
     The WebUI can be launched directly with its local .venv. That venv has the
     WebUI dependencies (for example PyYAML), but may not have Hermes Agent on its
     import path. In that case the server starts healthy, then chat fails later
-    with "AIAgent not available". Prefer the agent venv when it is usable, and
-    validate the final interpreter before starting the server.
+    with "AIAgent not available". Validate the final interpreter before starting
+    the server. In the POSIX source-backed integration, an explicit
+    ``HERMES_WEBUI_PYTHON`` is authoritative and fails closed instead of
+    silently drifting into the Agent's mutable environment.
     """
     if _python_can_run_webui_and_agent(python_exe, agent_dir):
         return python_exe
+
+    if _uses_explicit_webui_runtime(agent_dir):
+        raise RuntimeError(
+            "Explicit HERMES_WEBUI_PYTHON failed startup preflight: the selected "
+            "interpreter cannot import both WebUI dependencies and "
+            "run_agent.AIAgent. Refusing to fall back to the Hermes Agent venv, "
+            "which may be replaced by an Agent or Gateway update. Repair the "
+            "WebUI-owned environment or choose another HERMES_WEBUI_PYTHON."
+        )
 
     agent_candidates: list[Path] = []
     if agent_dir:
@@ -570,6 +606,7 @@ def main() -> int:
         install_hermes_agent()
         agent_dir = discover_agent_dir()
 
+    _prepare_explicit_webui_runtime(agent_dir)
     python_exe = ensure_python_has_webui_deps(discover_launcher_python(agent_dir), agent_dir)
     state_dir = Path(
         os.getenv("HERMES_WEBUI_STATE_DIR")
@@ -580,6 +617,10 @@ def main() -> int:
     # Mutate os.environ so child (or post-execv) inherits the resolved values.
     os.environ["HERMES_WEBUI_HOST"] = args.host
     os.environ["HERMES_WEBUI_PORT"] = str(args.port)
+    # Bind all server-side runtime discovery to the interpreter that passed the
+    # import preflight.  In particular, api.config must not rediscover a newly
+    # replaced or stale Agent venv after bootstrap selected a WebUI-owned one.
+    os.environ["HERMES_WEBUI_PYTHON"] = python_exe
     os.environ.setdefault("HERMES_WEBUI_STATE_DIR", str(state_dir))
     if agent_dir:
         os.environ["HERMES_WEBUI_AGENT_DIR"] = str(agent_dir)
