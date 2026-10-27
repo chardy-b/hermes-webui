@@ -327,7 +327,7 @@ If an AI assistant is helping with install, reinstall, bootstrap, provider setup
 | Thing | How it finds it |
 |---|---|
 | Hermes agent dir | `HERMES_WEBUI_AGENT_DIR`, then known checkout paths, the `hermes` launcher on `PATH`, and finally the installed `run_agent` module exposed by `HERMES_WEBUI_PYTHON` |
-| Python executable | Agent venv first, then `.venv` in this repo, then system `python3` |
+| Python executable | Explicit `HERMES_WEBUI_PYTHON`, otherwise Agent venv first, then `.venv` in this repo, then system `python3` |
 | State directory | `HERMES_WEBUI_STATE_DIR` env, then `$HERMES_HOME/webui` (Windows default `%LOCALAPPDATA%\hermes\webui`, POSIX default `~/.hermes/webui`) |
 | Default workspace | `HERMES_WEBUI_DEFAULT_WORKSPACE` env, then `~/workspace`, then state dir |
 | Port | `HERMES_WEBUI_PORT` env or first argument, default `8787` |
@@ -357,7 +357,7 @@ Full list of environment variables:
 | Variable | Default | Description |
 |---|---|---|
 | `HERMES_WEBUI_AGENT_DIR` | auto-discovered | Path to the Hermes Agent source or installed module root |
-| `HERMES_WEBUI_PYTHON` | auto-discovered | Python executable |
+| `HERMES_WEBUI_PYTHON` | auto-discovered | Python executable. For a POSIX source-backed bootstrap it is authoritative: bootstrap import-checks it and fails rather than silently falling back to the Agent venv |
 | `HERMES_WEBUI_HOST` | `127.0.0.1` | Bind address (`0.0.0.0` for all IPv4, `::` for all IPv6, `::1` for IPv6 loopback) |
 | `HERMES_WEBUI_PORT` | `8787` | Port |
 | `HERMES_WEBUI_STATE_DIR` | `$HERMES_HOME/webui` (Windows default `%LOCALAPPDATA%\hermes\webui`, POSIX default `~/.hermes/webui`) | Where sessions and state are stored. **Note (upgrade):** the default now follows `HERMES_HOME` — if you previously relocated `HERMES_HOME` to a non-default base **without** setting `HERMES_WEBUI_STATE_DIR`, your WebUI state now resolves to `$HERMES_HOME/webui` instead of the old platform-default `~/.hermes/webui`. To keep using the old location, set `HERMES_WEBUI_STATE_DIR` to it (or move the directory). Installs with `HERMES_HOME` unset or at the default base are unaffected. |
@@ -377,6 +377,18 @@ Full list of environment variables:
 | `HERMES_WEBUI_SESSIONS_MAX` | `100` | Legacy operator override for the max compact `Session` objects held in the in-memory LRU. Prefer the `webui.sessions_cache_max` key in `config.yaml` (which takes precedence); this env var remains a fallback. Bounds resident memory so long-running installs cannot accumulate every session ever touched and eventually crash (#4765/#2233/#4633). Eviction only ever drops clean, persisted, non-active sessions; an evicted session lazily reloads from its JSON sidecar on next access |
 
 Extension deployments can inspect sanitized, authenticated diagnostics at `GET /api/extensions/status`; see [WebUI Extensions](docs/EXTENSIONS.md#diagnostics).
+
+For a self-managed Agent source checkout whose project-managed Python is not a
+suitable WebUI runtime, point `HERMES_WEBUI_AGENT_DIR` at the source and
+`HERMES_WEBUI_PYTHON` at a separately provisioned WebUI environment containing
+both WebUI and Agent runtime dependencies. On POSIX, bootstrap keeps
+`run_agent` in that explicit interpreter by defaulting
+`HERMES_DISABLE_LAZY_INSTALLS=1` for the child process, verifies that `yaml` and
+`run_agent.AIAgent` import there, and exports the verified interpreter to the
+server. A failed explicit preflight is fatal; bootstrap does not fall back to or
+run pip against the Agent's project-managed environment. Direct `server.py`
+launches, automatic interpreter selection, native Windows, and an explicitly
+set `HERMES_DISABLE_LAZY_INSTALLS` retain their existing behavior.
 
 ---
 

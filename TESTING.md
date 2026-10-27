@@ -68,6 +68,19 @@ without ruff aren't blocked, while CI (which installs ruff) enforces it. The
 diff-scoped gate runs as the `lint` job in `.github/workflows/tests.yml` and is
 also part of the maintainer pre-release pre-gate.
 
+## Bootstrap runtime preflight regression
+
+`tests/test_bootstrap_python_selection.py` includes a real subprocess fixture
+that makes a fake `run_agent` re-exec into a project-managed interpreter which
+fails with `ModuleNotFoundError: yaml`. It pins the POSIX lazy-install guard,
+the authoritative `HERMES_WEBUI_PYTHON` failure path, and preservation of
+automatic/manual and native-Windows behavior. Run this bounded gate without the
+suite's shared HTTP server fixture:
+
+```bash
+./scripts/test.sh --noconftest tests/test_bootstrap_python_selection.py -q
+```
+
 ## Automated browser smoke (runtime brick-class gate)
 
 The ESLint guard above catches `const`-reassign / import-assign statically. The

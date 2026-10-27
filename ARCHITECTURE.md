@@ -121,8 +121,22 @@ Log file:
 
 ## 3. Runtime Environment
 
-- Python interpreter: <agent-dir>/venv/bin/python
-- The venv has all Hermes agent dependencies (run_agent, tools/*, cron/*)
+- Python interpreter: explicit `HERMES_WEBUI_PYTHON`, otherwise the discovered
+  Agent venv, repo `.venv`, or system Python in that order
+- Bootstrap verifies the selected interpreter can import both `yaml` and
+  `run_agent.AIAgent` before starting `server.py`
+- For a POSIX source-backed bootstrap, an explicit `HERMES_WEBUI_PYTHON` is
+  authoritative: failed preflight exits instead of falling back to a mutable
+  Agent venv, and the verified path is exported so server-side discovery uses
+  the same interpreter
+- For an explicit, source-backed POSIX runtime, bootstrap defaults
+  `HERMES_DISABLE_LAZY_INSTALLS=1` in the WebUI process environment so an Agent
+  source import cannot re-exec into a different project-managed Python. This is
+  scoped away from automatic selection, direct manual `server.py` launches, and
+  native Windows, and an operator-provided value is preserved
+- The selected environment must have all Hermes agent dependencies
+  (`run_agent`, `tools/*`, `cron/*`); bootstrap never installs WebUI packages
+  into Hermes's project-managed environment when the explicit preflight fails
 - Server binds to 127.0.0.1:8787 (localhost only, not public internet)
 - Access from Mac: SSH tunnel: ssh -N -L 8787:127.0.0.1:8787 <user>@<your-server>
 - The server imports Hermes modules via sys.path.insert(0, parent_dir)

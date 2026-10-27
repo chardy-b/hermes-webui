@@ -16,6 +16,7 @@ If your symptom isn't listed and the diagnostics don't narrow it down, file a bu
 2. **Symlink with a typo or wrong target.** A symlink to the agent looks correct on `ls`, but `readlink` resolves to a path that doesn't exist or doesn't contain `agent/__init__.py`.
 3. **`HERMES_WEBUI_AGENT_DIR` set to the wrong directory.** Override env var beats auto-discovery and points at a directory that has no agent code.
 4. **Agent installed as root, under the FHS layout.** When the Hermes Agent installer runs as root on Linux it places the agent at `/usr/local/lib/hermes-agent` (CLI linked into `/usr/local/bin`), not `~/.hermes/hermes-agent`. Older `bootstrap.py` didn't probe that path, so it built a WebUI-only `.venv` and failed at launch with **"Python environment cannot import both WebUI dependencies and Hermes Agent."** `git pull` to update the WebUI (current `bootstrap.py` auto-discovers the FHS layout and follows the `hermes` launcher to the agent), or set `HERMES_WEBUI_PYTHON=/usr/local/lib/hermes-agent/venv/bin/python` and relaunch.
+5. **Self-managed Agent PM Python differs from the WebUI runtime.** Importing `run_agent.AIAgent` can lazily re-exec into the Agent's project-managed Python; if that interpreter lacks a WebUI dependency such as `yaml`, startup fails there even though the WebUI environment is complete. Set `HERMES_WEBUI_AGENT_DIR` to the source checkout and `HERMES_WEBUI_PYTHON` to the separately provisioned WebUI environment. Bootstrap keeps the import in that explicit environment on POSIX, and fails clearly without falling back to or modifying the Agent PM environment.
 
 ### Step 1 — confirm the agent location
 
@@ -38,9 +39,15 @@ The startup banner prints which Python and agent dir it resolved. If the agent d
 
 ```bash
 export HERMES_WEBUI_AGENT_DIR=/absolute/path/to/hermes-agent
-export HERMES_WEBUI_PYTHON=/absolute/path/to/agent/venv/bin/python
+export HERMES_WEBUI_PYTHON=/absolute/path/to/python
 ./start.sh
 ```
+
+For a conventional install, the path may be the Agent venv. For a self-managed
+source install with a separate PM Python, use the WebUI-owned environment that
+has already been provisioned with both WebUI and Agent runtime dependencies.
+The override is authoritative: if its import preflight fails, bootstrap reports
+an error instead of silently selecting the Agent venv.
 
 ### Step 3 — install the agent in editable mode
 
@@ -48,8 +55,12 @@ This is the most common fix and resolves the original issue #1695:
 
 ```bash
 cd /path/to/hermes-agent          # the directory holding pyproject.toml + the agent/ module
-pip install -e .                  # use the same python that runs the WebUI
+$HERMES_WEBUI_PYTHON -m pip install -e .
 ```
+
+This command targets the WebUI-owned environment named by
+`HERMES_WEBUI_PYTHON`. Do not run it with the Agent's project-managed Python
+merely to satisfy WebUI startup.
 
 Then restart the WebUI:
 
