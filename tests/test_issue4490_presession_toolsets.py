@@ -113,12 +113,19 @@ def test_pending_toolsets_only_forwarded_from_empty_composer():
 def test_load_existing_session_clears_staged_toolsets():
     """Loading a real existing session must clear any abandoned staged override.
 
-    loadSession() assigns S.session=data.session on the success path; the staged
-    value is cleared there so a subsequent New Chat does not inherit it (#4490).
+    loadSession() assigns the metadata-only copy (_sessionMetadata, stripped of
+    messages) to S.session on the success path; the staged value is cleared there
+    so a subsequent New Chat does not inherit it (#4490).
     """
     body = _function_body(SESSIONS_JS, "async function loadSession")
     compact = body.replace(" ", "")
-    assign = compact.index("S.session=data.session")
+    # Metadata ownership: S.session must be a copy with messages removed, never
+    # the shared response object (the tail is adopted later by the messages loader).
+    copy = compact.index("const_sessionMetadata={...data.session};")
+    strip = compact.index("delete_sessionMetadata.messages;")
+    assign = compact.index("S.session=_sessionMetadata;")
+    assert copy < strip < assign
+    assert "S.session=data.session" not in compact
     # The clear must accompany the real-session assignment, not only the create path.
     assert "S._pendingSessionToolsets=null" in compact[assign : assign + 400]
 
