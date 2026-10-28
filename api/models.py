@@ -2,6 +2,7 @@
 import collections
 import copy
 import datetime
+import functools
 import hashlib
 import inspect
 import json
@@ -81,6 +82,18 @@ _CLI_SESSIONS_CACHE_INVALIDATION_VERSION = 0
 _CLI_SESSIONS_CACHE: "collections.OrderedDict[tuple, tuple]" = collections.OrderedDict()
 _CLI_SESSIONS_CACHE_MAX_ENTRIES = 8
 _CLI_SESSIONS_CACHE_WAIT_SECONDS = 0.25
+# Per-profile projection entries that sit beneath the all-profiles aggregate
+# above: one profile's state.db commit used to bust the aggregate key and
+# re-run the loader for EVERY profile. Entries share the aggregate's lock,
+# in-flight (single-flight) map, invalidation generation and TTL, but live in
+# their own LRU so a handful of profiles can't evict aggregate entries. Each
+# value is one profile's deep-copied projection, so the aggregate (the union of
+# these) stays the only thing handed to callers.
+_CLI_PROFILE_PROJECTION_CACHE: "collections.OrderedDict[tuple, tuple]" = collections.OrderedDict()
+_CLI_PROFILE_PROJECTION_CACHE_MAX_ENTRIES = 32
+# A concurrent rebuild of the SAME profile entry is awaited this long before
+# falling back to loading it directly (the owner died or is wedged).
+_CLI_PROFILE_PROJECTION_WAIT_SECONDS = 30.0
 # Event waits that keep stale rows visible while a rebuild is in flight.
 _CLI_SESSIONS_CACHE_STALE_WAIT_SECONDS = 0.10
 
@@ -7066,7 +7079,7 @@ def _claude_code_title(messages: list[dict], summary_title: str | None) -> str:
     return 'Claude Code Session'
 
 
-def get_claude_code_sessions(projects_dir: Path | str | None = None, *, max_files: int = CLAUDE_CODE_MAX_FILES, max_file_bytes: int = CLAUDE_CODE_MAX_FILE_BYTES) -> list:
+def get_claude_code_sessions(projects_dir: Path | str | None = None, *, max_files: int = CLAUDE_CODE_MAX_FILES, max_file_bytes: int = CLAUDE_CODE_MAX_FILE_BYTES, _selected_files=None) -> list:
     """Read Claude Code JSONL sessions as read-only external-agent rows.
 
     The bridge is additive and defensive: it skips symlinks, oversized files,
@@ -7080,7 +7093,11 @@ def get_claude_code_sessions(projects_dir: Path | str | None = None, *, max_file
     # cwd, so calling it once per row was ~200 redundant stat()s on the cold
     # sidebar build (#4718). Resolve it a single time.
     cc_workspace = str(get_last_workspace())
-    for path in _iter_claude_code_jsonl_files(projects_dir, max_files=max_files, max_file_bytes=max_file_bytes) or []:
+    # ``_selected_files`` is an already-materialized exact selection (the one
+    # the all-profiles stamp was built from); None means walk as usual.
+    if _selected_files is None:
+        _selected_files = _iter_claude_code_jsonl_files(projects_dir, max_files=max_files, max_file_bytes=max_file_bytes) or []
+    for path in _selected_files:
         messages, summary_title, first_ts, last_ts = _parse_claude_code_jsonl_cached(path)
         if not messages:
             continue
@@ -7142,6 +7159,7 @@ def clear_cli_sessions_cache() -> None:
         global _CLI_SESSIONS_CACHE_INVALIDATION_VERSION
         _CLI_SESSIONS_CACHE_INVALIDATION_VERSION += 1
         _CLI_SESSIONS_CACHE.clear()
+        _CLI_PROFILE_PROJECTION_CACHE.clear()
     # The sidecar-metadata projection cache is stat-keyed (self-invalidating on
     # any file change), but clear it alongside the CLI cache so an explicit
     # reset — a mutating sidebar action or test isolation — starts fully cold.
@@ -7182,24 +7200,32 @@ def _cache_cli_sessions_if_current(
     ttl: float,
     invalidation_stamp: int,
     sessions: list,
+    *,
+    cache=None,
+    max_entries=None,
 ) -> bool:
+    if cache is None:
+        cache = _CLI_SESSIONS_CACHE
+        max_entries = _CLI_SESSIONS_CACHE_MAX_ENTRIES
     with _CLI_SESSIONS_CACHE_LOCK:
         if _CLI_SESSIONS_CACHE_INVALIDATION_VERSION != invalidation_stamp:
             return False
-        _CLI_SESSIONS_CACHE[cache_key] = (
+        cache[cache_key] = (
             time.monotonic() + ttl,
             invalidation_stamp,
             _copy_cli_sessions(sessions),
         )
-        _CLI_SESSIONS_CACHE.move_to_end(cache_key)
-        while len(_CLI_SESSIONS_CACHE) > _CLI_SESSIONS_CACHE_MAX_ENTRIES:
-            _CLI_SESSIONS_CACHE.popitem(last=False)
+        cache.move_to_end(cache_key)
+        while len(cache) > max_entries:
+            cache.popitem(last=False)
     return True
 
 
-def _copy_fresh_cli_sessions_cache_entry(cache_key: tuple):
+def _copy_fresh_cli_sessions_cache_entry(cache_key: tuple, *, cache=None):
+    if cache is None:
+        cache = _CLI_SESSIONS_CACHE
     with _CLI_SESSIONS_CACHE_LOCK:
-        cached_entry = _CLI_SESSIONS_CACHE.get(cache_key)
+        cached_entry = cache.get(cache_key)
         if cached_entry is None:
             return None
         if len(cached_entry) == 3:
@@ -7208,12 +7234,12 @@ def _copy_fresh_cli_sessions_cache_entry(cache_key: tuple):
             cached_expires_at, cached_sessions = cached_entry
             cached_stamp = _CLI_SESSIONS_CACHE_INVALIDATION_VERSION
         if cached_stamp != _CLI_SESSIONS_CACHE_INVALIDATION_VERSION:
-            _CLI_SESSIONS_CACHE.pop(cache_key, None)
+            cache.pop(cache_key, None)
             return None
         if cached_expires_at <= time.monotonic():
             return None
         # LRU: a fresh hit is the most-recently-used entry.
-        _CLI_SESSIONS_CACHE.move_to_end(cache_key)
+        cache.move_to_end(cache_key)
         return _copy_cli_sessions(cached_sessions)
 
 
@@ -7348,6 +7374,19 @@ def _callable_accepts_include_claude_code(callable_obj) -> bool:
     except (TypeError, ValueError):
         return True
     if 'include_claude_code' in signature.parameters:
+        return True
+    return any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+
+
+def _callable_accepts_kwarg(callable_obj, name: str) -> bool:
+    try:
+        signature = inspect.signature(callable_obj)
+    except (TypeError, ValueError):
+        return False
+    if name in signature.parameters:
         return True
     return any(
         parameter.kind == inspect.Parameter.VAR_KEYWORD
@@ -7578,6 +7617,32 @@ def _all_profiles_cli_contexts() -> tuple[list[tuple[Path, Path, str | None]], t
     return contexts, tuple(cache_entries)
 
 
+# Records, for the current thread only, the sidecar stat signature
+# ``_state_projection_sidecar_metadata`` actually used for each session id while
+# a per-profile CLI projection is being loaded (see
+# ``_cli_profile_projection_cached``). The recorded value is exactly what the
+# projection read, so re-checking it later cannot race the load.
+_SIDECAR_PROJECTION_RECORDER = threading.local()
+
+
+def _record_sidecar_projection_stat(sid: str, key) -> None:
+    sink = getattr(_SIDECAR_PROJECTION_RECORDER, 'sink', None)
+    if sink is not None:
+        sink[sid] = key
+
+
+def _current_sidecar_projection_stat(sid: str):
+    """Current signature of ``sid``'s sidecar, in the recorder's format."""
+    if not is_safe_session_id(sid):
+        return None
+    p = SESSION_DIR / f'{sid}.json'
+    try:
+        st = p.stat()
+    except OSError:
+        return None
+    return (str(p), st.st_mtime_ns, st.st_size, st.st_ctime_ns)
+
+
 def clear_sidecar_metadata_cache() -> None:
     """Drop all memoized sidebar-projection sidecar metadata (test/lifecycle hook)."""
     with _SIDECAR_METADATA_CACHE_LOCK:
@@ -7610,7 +7675,9 @@ def _state_projection_sidecar_metadata(sid: str) -> dict:
     except OSError:
         # No sidecar file (the common case for a pure state.db row) or it
         # vanished mid-build — nothing to project, and nothing worth caching.
+        _record_sidecar_projection_stat(sid, None)
         return dict(default)
+    _record_sidecar_projection_stat(sid, key)
 
     with _SIDECAR_METADATA_CACHE_LOCK:
         hit = _SIDECAR_METADATA_CACHE.get(key)
@@ -7651,11 +7718,19 @@ def _load_cli_sessions_uncached(
     webhook_project_limit: int | None | bool = WEBHOOK_PROJECT_CHIP_LIMIT,
     kanban_project_limit: int | None | bool = KANBAN_PROJECT_CHIP_LIMIT,
     include_claude_code: bool = True,
+    claude_code_files=None,
 ) -> list:
     cli_sessions = []
     if source_filter in (None, CLAUDE_CODE_SOURCE) and include_claude_code:
         try:
-            cli_sessions.extend(get_claude_code_sessions())
+            if claude_code_files is not None and _callable_accepts_kwarg(
+                get_claude_code_sessions, '_selected_files'
+            ):
+                cli_sessions.extend(
+                    get_claude_code_sessions(_selected_files=claude_code_files)
+                )
+            else:
+                cli_sessions.extend(get_claude_code_sessions())
         except Exception:
             logger.debug("Claude Code session scan failed", exc_info=True)
 
@@ -8037,6 +8112,227 @@ def _load_cli_sessions_uncached(
     return cli_sessions
 
 
+def _select_claude_code_files() -> tuple:
+    """Materialize the exact Claude Code file selection (one directory walk)."""
+    return tuple(
+        _iter_claude_code_jsonl_files(
+            _default_claude_code_projects_dir(),
+            max_files=CLAUDE_CODE_MAX_FILES,
+            max_file_bytes=CLAUDE_CODE_MAX_FILE_BYTES,
+        ) or []
+    )
+
+
+def _claude_code_projection_stamp(selected_files=None):
+    """Signature of every Claude Code transcript the projection would parse.
+
+    Same identity the per-file parse cache uses, so a per-profile entry that
+    embeds Claude Code rows can't outlive an edit to a transcript.
+    ``selected_files`` is the shared exact selection; when omitted it is walked
+    here.
+    """
+    projects_dir = _default_claude_code_projects_dir()
+    files = []
+    if selected_files is None:
+        selected_files = _select_claude_code_files()
+    for path in selected_files:
+        try:
+            st = path.stat()
+        except OSError:
+            files.append((str(path), None))
+            continue
+        files.append((str(path), st.st_mtime_ns, st.st_size, st.st_ctime_ns))
+    return (
+        _path_cache_key(projects_dir),
+        _path_stat_cache_key(projects_dir),
+        tuple(files),
+    )
+
+
+def _cli_profile_projection_shared_stamp() -> tuple:
+    """Inputs of every profile's projection that are not per-profile.
+
+    The aggregate key already carries the session-index stamp; the rest are read
+    by ``_load_cli_sessions_uncached`` directly (sidecar directory, deleted-WebUI
+    tombstone, projects.json for the cron/webhook project ids of the ACTIVE
+    profile, and the active workspace echoed onto every row). Any failure to
+    read them raises, and the caller then bypasses the per-profile cache.
+    """
+    from api.profiles import get_active_profile_name
+
+    return (
+        _path_cache_key(SESSION_DIR),
+        _path_stat_cache_key(SESSION_INDEX_FILE),
+        _path_stat_cache_key(_webui_deleted_session_tombstone_file()),
+        _path_cache_key(PROJECTS_FILE),
+        _path_stat_cache_key(PROJECTS_FILE),
+        str(get_active_profile_name() or ''),
+        str(get_last_workspace()),
+    )
+
+
+def _cli_profile_projection_cache_key(
+    context,
+    context_stamp,
+    source_filter,
+    include_claude_code: bool,
+    shared_stamp: tuple,
+    claude_files=None,
+) -> tuple:
+    """Complete identity of one profile's projection.
+
+    ``context_stamp`` is the profile's ``(home, profile, sqlite stamp)`` entry
+    from ``_all_profiles_cli_contexts``. ``include_claude_code`` is the value
+    handed to THIS context's loader (only the first context ever receives
+    True), so an active-profile reorder moves Claude Code rows to a different
+    key instead of reusing an entry built under the other assignment.
+    """
+    hermes_home, db_path, profile = context
+    claude_stamp = None
+    if include_claude_code and source_filter in (None, CLAUDE_CODE_SOURCE):
+        claude_stamp = _claude_code_projection_stamp(claude_files)
+    return (
+        'profile-projection',
+        _path_cache_key(hermes_home),
+        _path_cache_key(db_path),
+        str(profile or ''),
+        context_stamp,
+        source_filter or '',
+        bool(include_claude_code),
+        claude_stamp,
+        _path_stat_cache_key(Path(hermes_home) / 'cron' / 'jobs.json'),
+        shared_stamp,
+    )
+
+
+def _cli_profile_projection_cached(cache_key: tuple, ttl: float, load) -> list:
+    """Return one profile's projection from its entry, loading it single-flight.
+
+    An entry stores ``(rows, sidecar_signature)``. The signature is what the
+    loader itself saw for every sidecar it consulted; a reused entry is only
+    served while those files are unchanged, so a title/archived edit that moved
+    neither the session index nor the invalidation generation (another process,
+    a ``skip_index`` save) is still picked up. ``load`` exceptions propagate
+    unchanged (the aggregate caller owns the failure contract) and nothing is
+    stored for them. A result is only stored when no global invalidation
+    happened since before the load started.
+    """
+    cache = _CLI_PROFILE_PROJECTION_CACHE
+
+    def lookup():
+        hit = _copy_fresh_cli_sessions_cache_entry(cache_key, cache=cache)
+        if hit is None:
+            return None
+        rows, sidecar_signature = hit
+        for sid, recorded in sidecar_signature:
+            if _current_sidecar_projection_stat(sid) != recorded:
+                return None
+        return rows
+
+    def load_recording():
+        previous = getattr(_SIDECAR_PROJECTION_RECORDER, 'sink', None)
+        sink: dict = {}
+        _SIDECAR_PROJECTION_RECORDER.sink = sink
+        try:
+            rows = load()
+        finally:
+            _SIDECAR_PROJECTION_RECORDER.sink = previous
+        return rows, tuple(sorted(sink.items(), key=lambda item: item[0]))
+
+    deadline = time.monotonic() + _CLI_PROFILE_PROJECTION_WAIT_SECONDS
+    while True:
+        cached = lookup()
+        if cached is not None:
+            return cached
+        event, is_owner = _cli_sessions_cache_claim_rebuild(cache_key)
+        if is_owner:
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not event.wait(remaining):
+            # The owner is wedged: load directly rather than block forever.
+            return load()
+    try:
+        invalidation_stamp = _cli_sessions_cache_invalidation_stamp()
+        rows, sidecar_signature = load_recording()
+        _cache_cli_sessions_if_current(
+            cache_key,
+            ttl,
+            invalidation_stamp,
+            (rows, sidecar_signature),
+            cache=cache,
+            max_entries=_CLI_PROFILE_PROJECTION_CACHE_MAX_ENTRIES,
+        )
+        return rows
+    finally:
+        _cli_sessions_cache_done(cache_key, event)
+
+
+def _load_all_profiles_cli_sessions(
+    contexts,
+    context_stamps,
+    *,
+    source_filter,
+    include_claude_code: bool,
+    loader_supports_include_claude_code: bool,
+    ttl: float,
+) -> list:
+    """Concatenate every profile's projection, recomputing only stale entries."""
+    use_profile_cache = ttl > 0 and len(context_stamps) == len(contexts)
+    shared_stamp = None
+    if use_profile_cache:
+        try:
+            shared_stamp = _cli_profile_projection_shared_stamp()
+        except Exception:
+            logger.debug("per-profile CLI projection cache bypassed", exc_info=True)
+            use_profile_cache = False
+
+    merged: list[dict] = []
+    for idx, context in enumerate(contexts):
+        ctx_home, ctx_db_path, ctx_profile = context
+        load_kwargs = {
+            'source_filter': source_filter,
+            'visible_session_limit': None,
+            'cron_project_limit': None,
+            'webhook_project_limit': None,
+            'kanban_project_limit': None,
+        }
+        include_here = bool(include_claude_code and idx == 0)
+        if loader_supports_include_claude_code:
+            load_kwargs['include_claude_code'] = include_here
+        claude_files = None
+        if (
+            use_profile_cache
+            and include_here
+            and source_filter in (None, CLAUDE_CODE_SOURCE)
+        ):
+            # ONE exact selection feeds both the stamp and this loader.
+            try:
+                claude_files = _select_claude_code_files()
+            except Exception:
+                logger.debug("Claude Code selection unavailable", exc_info=True)
+            if claude_files is not None and _callable_accepts_kwarg(
+                _load_cli_sessions_uncached, 'claude_code_files'
+            ):
+                load_kwargs['claude_code_files'] = claude_files
+        load = functools.partial(
+            _load_cli_sessions_uncached, ctx_home, ctx_db_path, ctx_profile, **load_kwargs
+        )
+        cache_key = None
+        if use_profile_cache:
+            try:
+                cache_key = _cli_profile_projection_cache_key(
+                    context, context_stamps[idx], source_filter, include_here, shared_stamp,
+                    claude_files,
+                )
+            except Exception:
+                logger.debug("per-profile CLI projection key unavailable", exc_info=True)
+        if cache_key is None:
+            merged.extend(load())
+        else:
+            merged.extend(_cli_profile_projection_cached(cache_key, ttl, load))
+    return merged
+
+
 def get_cli_sessions(
     source_filter=None,
     *,
@@ -8052,13 +8348,24 @@ def get_cli_sessions(
     source_filter = _normalize_cli_session_source_filter(source_filter)
     if all_profiles:
         contexts, context_cache_key = _all_profiles_cli_contexts()
+        # Real per-profile SQLite stamps (aligned with ``contexts``); the
+        # aggregate key below may swap them for a streaming-frozen marker.
+        context_stamps = context_cache_key
         db_path = "all profiles"
         # #4842: freeze the volatile per-profile state.db component while
         # streaming so a streamed message row in one profile doesn't bust the
         # all-profiles CLI cache and re-run every profile's heavy projection.
         _streaming_marker = _cli_sessions_streaming_freeze_marker()
         if _streaming_marker is not None:
-            context_cache_key = ('streaming-frozen', _streaming_marker)
+            # Freeze ONLY the volatile SQLite stamps. Ordered profile identity
+            # (active-profile order, Claude Code first-profile assignment) and
+            # membership stay in the key so a switch/add/remove mid-stream
+            # still reaches the per-profile cache.
+            context_cache_key = (
+                'streaming-frozen',
+                _streaming_marker,
+                tuple((entry[0], entry[1]) for entry in context_stamps),
+            )
         cache_key = (
             'all_profiles',
             source_filter or '',
@@ -8089,26 +8396,14 @@ def get_cli_sessions(
             _load_cli_sessions_uncached
         )
         if all_profiles:
-            merged: list[dict] = []
-            for idx, (ctx_home, ctx_db_path, ctx_profile) in enumerate(contexts):
-                load_kwargs = {
-                    'source_filter': source_filter,
-                    'visible_session_limit': None,
-                    'cron_project_limit': None,
-                    'webhook_project_limit': None,
-                    'kanban_project_limit': None,
-                }
-                if loader_supports_include_claude_code:
-                    load_kwargs['include_claude_code'] = include_claude_code and idx == 0
-                merged.extend(
-                    _load_cli_sessions_uncached(
-                        ctx_home,
-                        ctx_db_path,
-                        ctx_profile,
-                        **load_kwargs,
-                    )
-                )
-            return merged
+            return _load_all_profiles_cli_sessions(
+                contexts,
+                context_stamps,
+                source_filter=source_filter,
+                include_claude_code=include_claude_code,
+                loader_supports_include_claude_code=loader_supports_include_claude_code,
+                ttl=ttl,
+            )
         load_kwargs = {'source_filter': source_filter}
         if loader_supports_include_claude_code:
             load_kwargs['include_claude_code'] = include_claude_code
