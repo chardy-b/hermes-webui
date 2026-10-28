@@ -31,14 +31,15 @@ def _extract_function(src: str, signature: str) -> str:
 
 def test_load_session_initial_metadata_request_defers_model_resolution_until_after_state_assignment():
     body = _extract_function(SESSIONS_JS, "async function loadSession(sid")
-    fast_metadata_fetch = "messages=0&resolve_model=0"
+    fast_session_fetch = "_sessionMessagesRequestUrl(sid)"
     deferred_metadata_fetch = "messages=0&resolve_model=1"
-    assignment = "S.session=data.session"
+    assignment = "S.session=_sessionMetadata"
 
-    assert fast_metadata_fetch in body[: body.index(assignment)], (
-        "loadSession() first paint must use the metadata fast path so session "
-        "switching cannot block on cold model catalog hydration"
+    assert fast_session_fetch in body[: body.index(assignment)], (
+        "loadSession() first paint must use the one-request bounded transcript path"
     )
+    request_helper = _extract_function(SESSIONS_JS, "function _sessionMessagesRequestUrl(sid")
+    assert "messages=1&resolve_model=0" in request_helper
     assert deferred_metadata_fetch not in body[: body.index(assignment)], (
         "loadSession() must not resolve model metadata before assigning S.session; "
         "stale model/provider correction belongs to the deferred path"

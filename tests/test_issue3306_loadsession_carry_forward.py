@@ -33,7 +33,7 @@ def _load_session_clear_block() -> str:
     """The if(currentSid!==sid||forceReload){...} block in loadSession()."""
     start = SESSIONS_JS.index("async function loadSession(sid)")
     clear_start = SESSIONS_JS.index("if (currentSid !== sid || forceReload) {", start)
-    clear_end = SESSIONS_JS.index("// Phase 1: Load metadata only", clear_start)
+    clear_end = SESSIONS_JS.index("// Load the bounded transcript tail", clear_start)
     return SESSIONS_JS[clear_start:clear_end]
 
 

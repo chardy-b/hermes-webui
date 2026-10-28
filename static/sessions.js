@@ -1846,13 +1846,16 @@ async function loadSession(sid){
     const _msgInner = $('msgInner');
     if (_msgInner && currentSid !== sid) _msgInner.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-muted);font-size:14px;padding:40px;text-align:center;">Loading conversation...</div>';
   }
-  // Phase 1: Load metadata only (~1KB) for fast session switching. Keep model
-  // resolution out of the first-paint path; old provider-shaped model IDs are
-  // repaired by the deferred resolver after S.session is assigned.
+  // Load the bounded transcript tail and metadata in ONE request. The old path
+  // fetched messages=0 here and then serialized a messages=1 request in
+  // _ensureMessagesLoaded(), making every switch wait for two expensive session
+  // reconciliations. Keep model resolution out of the first-paint path; old
+  // provider-shaped model IDs are repaired by the deferred resolver after
+  // S.session is assigned.
   // Guard against network/server failures to prevent a permanently stuck loading state.
   let data;
   try {
-    data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=0&resolve_model=0`);
+    data = await api(_sessionMessagesRequestUrl(sid), {timeoutMs:120000});
   } catch(e) {
     const profileMismatch=_sessionProfileMismatchFromError(e);
     if(profileMismatch && profileMismatch.profile && !opts.skipProfileResolve){
@@ -1987,7 +1990,13 @@ async function loadSession(sid){
     _loadingSessionId=null;
     return loadSession(continuationSid,{...opts,skipLineageResolve:true,skipContinuationResolve:true,force:true,_preloadNotified:true});
   }
-  S.session=data.session;
+  // _ensureMessagesLoaded() owns transcript adoption and its isolation guards.
+  // Keep only metadata in S.session until that helper consumes this response,
+  // matching the previous two-phase state shape without paying for two GETs.
+  const _initialMessagesData=data;
+  const _sessionMetadata={...data.session};
+  delete _sessionMetadata.messages;
+  S.session=_sessionMetadata;
   if(typeof _adoptRegenerationRevision==='function') _adoptRegenerationRevision(data.session);
   if(typeof _clearEmptyComposerModelOverride==='function') _clearEmptyComposerModelOverride();
   // Loading a real existing session abandons any pre-session toolset override
@@ -2135,7 +2144,7 @@ async function loadSession(sid){
     // this session's INFLIGHT snapshot, not leave prior-session rows in place.
     if(typeof clearLiveToolCards==='function') clearLiveToolCards();
     try {
-      await _ensureMessagesLoaded(sid, {force:_keepStaleUntilLoaded, loadGeneration:_loadGeneration});
+      await _ensureMessagesLoaded(sid, {force:_keepStaleUntilLoaded, loadGeneration:_loadGeneration, initialData:_initialMessagesData});
     } catch(e) {
       if (!_isCurrentLoad()) {
         _rearmActiveSessionStream();
@@ -2241,7 +2250,7 @@ async function loadSession(sid){
     // "messages already populated" early-return inside _ensureMessagesLoaded
     // does NOT skip the swap to the new transcript.
     try {
-      await _ensureMessagesLoaded(sid, {force:_keepStaleUntilLoaded, loadGeneration:_loadGeneration});
+      await _ensureMessagesLoaded(sid, {force:_keepStaleUntilLoaded, loadGeneration:_loadGeneration, initialData:_initialMessagesData});
     } catch (e) {
       if (!_isCurrentLoad()) {
         _rearmActiveSessionStream();
@@ -3105,6 +3114,18 @@ function _messageReloadLimitForSession(sid){
   return _INITIAL_MSG_LIMIT;
 }
 
+function _sessionMessagesRequestUrl(sid){
+  const reloadLimit = _messageReloadLimitForSession(sid); // defaults to _INITIAL_MSG_LIMIT
+  // A reload window above the server ceiling must use the bare full-transcript
+  // request; otherwise server clamping can silently shrink a force-reloaded pane.
+  const boundedReloadLimit = (reloadLimit && reloadLimit <= _msgLimitMax) ? reloadLimit : null;
+  const reloadLimitParam = boundedReloadLimit ? `&msg_limit=${boundedReloadLimit}` : '';
+  // Retained for compatibility with mixed-version servers. Visible-row
+  // expansion is the default on current backends.
+  const expandParam = boundedReloadLimit ? '&expand_renderable=1' : '';
+  return `/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0${reloadLimitParam}${expandParam}`;
+}
+
 function _syncToolCallsForLoadedMessages(messages, sessionToolCalls){
   const msgs=Array.isArray(messages)?messages:[];
   // During active streaming, skip — clearing S.toolCalls would lose Activity
@@ -3155,27 +3176,13 @@ async function _ensureMessagesLoaded(sid, opts) {
     _clearSameSessionForceReloadHint(sid);
     return;
   }
-  // Fetch session messages with a tail window for fast initial load.
-  const reloadLimit = _messageReloadLimitForSession(sid); // defaults to _INITIAL_MSG_LIMIT
-  // A reload window above the server's msg_limit ceiling would be clamped by
-  // the backend (returning only the last _MSG_LIMIT_MAX rows), which can
-  // silently SHRINK an already-loaded transcript that had more than the ceiling
-  // of rows visible (rows 400–999 replaced by 500–999). When the requested
-  // window exceeds the ceiling, fall back to the bare full-transcript request
-  // (no msg_limit / no expand_renderable) so a same-session refresh never drops
-  // already-loaded older rows (Codex gate #6154, silent row-loss).
-  const boundedReloadLimit = (reloadLimit && reloadLimit <= _msgLimitMax) ? reloadLimit : null;
-  const reloadLimitParam = boundedReloadLimit ? `&msg_limit=${boundedReloadLimit}` : '';
-  // Older frontends used expand_renderable=1 to request visible-row expansion.
-  // The server now counts msg_limit by visible transcript rows by default; keep
-  // the flag for compatibility with mixed-version deployments.
-  const expandParam = boundedReloadLimit ? '&expand_renderable=1' : '';
-  let data;
+  // loadSession supplies its one-request response. Other callers can omit it
+  // and retain the standalone fetch behavior.
+  let data=opts.initialData||null;
   try {
-    data = await api(
-      `/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0${reloadLimitParam}${expandParam}`,
-      {timeoutMs:120000}
-    );
+    if(!data){
+      data=await api(_sessionMessagesRequestUrl(sid),{timeoutMs:120000});
+    }
   } finally {
     if (_ownsLoad()) _clearSameSessionForceReloadHint(sid);
   }
@@ -3235,11 +3242,10 @@ async function _ensureMessagesLoaded(sid, opts) {
     if(typeof _adoptRegenerationRevision==='function') _adoptRegenerationRevision(data.session);
     S.session.message_count=Number(data.session.message_count || msgs.length);
     S.lastUsage={...(data.session.last_usage||S.lastUsage||{})};
-    // Phase 2: the messages=1 response carries the canonical cold-load
-    // `todo_state` snapshot, derived server-side from the FULL untruncated
-    // message list (api/routes.py + api/todo_state.py). The earlier
-    // messages=0 fetch in loadSession() does not include this field —
-    // attach_todo_state is gated on `load_messages`. Without applying it
+    // The messages=1 response carries the canonical cold-load `todo_state`
+    // snapshot, derived server-side from the FULL untruncated message list
+    // (api/routes.py + api/todo_state.py). Keep applying it during transcript
+    // adoption because attach_todo_state is gated on `load_messages`. Without it
     // here, long sessions whose latest todo write falls outside the
     // _INITIAL_MSG_LIMIT tail would lose the panel on refresh: the
     // legacy reverse-scan in _legacyTodosFromMessages() can only see the
