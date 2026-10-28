@@ -21,7 +21,7 @@ def _btn_new_chat_handler() -> str:
 def _load_session_clear_block() -> str:
     start = SESSIONS_JS.find("async function loadSession(")
     clear_start = SESSIONS_JS.find("if (currentSid !== sid || forceReload) {", start)
-    clear_end = SESSIONS_JS.find("// Phase 1: Load metadata only", clear_start)
+    clear_end = SESSIONS_JS.find("// Load the bounded transcript tail", clear_start)
     assert start != -1, "loadSession not found"
     assert clear_start != -1 and clear_end != -1, "loadSession clear block not found"
     return SESSIONS_JS[start:clear_end]

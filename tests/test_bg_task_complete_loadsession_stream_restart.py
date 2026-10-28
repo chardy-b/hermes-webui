@@ -55,13 +55,13 @@ def _load_session_body() -> str:
 def _catch_block() -> str:
     """Return the metadata-fetch ``catch(e){ ... }`` slice within loadSession.
 
-    Anchors on the ``data = await api(`/api/session?...messages=0...`)`` try and
-    walks brace balance over the following ``catch (e) { ... }`` block.
+    Anchors on the one-request ``_sessionMessagesRequestUrl`` call and walks
+    brace balance over the following ``catch (e) { ... }`` block.
     """
     body = _load_session_body()
-    # The metadata fetch is the first `catch(` after the messages=0 api() call.
-    anchor = re.search(r"messages=0[^\n]*resolve_model=0", body)
-    assert anchor is not None, "metadata fetch (messages=0&resolve_model=0) not found"
+    # The full-session fetch is the first catch after the shared URL helper call.
+    anchor = re.search(r"data\s*=\s*await api\(_sessionMessagesRequestUrl\(sid\),", body)
+    assert anchor is not None, "one-request session fetch not found"
     cm = re.search(r"catch\s*\(\s*e\s*\)\s*\{", body[anchor.end():])
     assert cm is not None, "catch(e){ for metadata fetch not found"
     open_abs = anchor.end() + cm.end() - 1  # index of '{'

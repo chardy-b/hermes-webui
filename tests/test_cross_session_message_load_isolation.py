@@ -118,7 +118,7 @@ def test_loadsession_has_generation_token_and_forwards_to_ensure_messages_loaded
         "loadSession() should check ownership in multiple await/catch paths, "
         "including stale _ensureMessagesLoaded catch branches"
     )
-    ensure_call = _normalise_ws("await _ensureMessagesLoaded(sid, {force:_keepStaleUntilLoaded, loadGeneration:_loadGeneration});")
+    ensure_call = _normalise_ws("await _ensureMessagesLoaded(sid, {force:_keepStaleUntilLoaded, loadGeneration:_loadGeneration, initialData:_initialMessagesData});")
     assert ensure_call in norm, (
         "loadSession() must pass generation into _ensureMessagesLoaded() for stale-owner checks"
     )
@@ -211,6 +211,7 @@ function createEnvironment() {
   globalThis._oldestIdx = 0;
   globalThis._messageRenderWindowSize = 0;
   globalThis._messageReloadLimitForSession = () => 2;
+  globalThis._sessionMessagesRequestUrl = (sid) => buildMessageUrl(sid, 1);
   // sessions.js module-level const, referenced by _ensureMessagesLoaded's
   // boundedReloadLimit ceiling check (#6152/#6154). Not one of the extracted
   // functions, so define it in the harness (matching the real value) or the
@@ -308,6 +309,7 @@ function createEnvironment() {
   globalThis._resolveSessionLineage = (sid) => sid;
 
   globalThis._messageReloadLimitForSession = () => 2;
+  globalThis._sessionMessagesRequestUrl = (sid) => buildMessageUrl(sid, 1);
 
   globalThis._msgInner = { innerHTML: 'INIT_LOADING' };
   const _msgInput = { value: '' };
@@ -440,9 +442,7 @@ function buildMessageUrl(sid, mode, suffix='') {
 
 function makeCrossSessionCalls(apiHost) {
   return {
-    beaconMeta: apiHost.enqueue(buildMessageUrl('sid-beacon', 0)),
     beaconMsgs: apiHost.enqueue(buildMessageUrl('sid-beacon', 1)),
-    atlasMeta: apiHost.enqueue(buildMessageUrl('sid-atlas', 0)),
     atlasMsgs: apiHost.enqueue(buildMessageUrl('sid-atlas', 1)),
   };
 }
@@ -461,27 +461,20 @@ function runCrossSessionOrderingBase({seedBeaconInflight, resolveBeaconMsgsBefor
 
   const first = loadSession('sid-beacon', { force: true });
   return (async () => {
-    await waitForQueued(apiHost, calls.beaconMeta.url);
-    calls.beaconMeta._resolve(API_BEACON_META);
-
     await waitForQueued(apiHost, calls.beaconMsgs.url);
     const second = loadSession('sid-atlas', { force: true });
-    await waitForQueued(apiHost, calls.atlasMeta.url);
+    await waitForQueued(apiHost, calls.atlasMsgs.url);
 
     if (resolveBeaconMsgsBeforeAtlasMeta) {
       calls.beaconMsgs._resolve(API_BEACON_MSGS);
       // Wait for the stale first load continuation to process so we can continue the
       // Atlas path from a clearly stale state.
       await first;
-      calls.atlasMeta._resolve(API_ATLAS_META);
-      await waitForQueued(apiHost, calls.atlasMsgs.url);
+      calls.atlasMsgs._resolve(API_ATLAS_MSGS);
     } else {
-      calls.atlasMeta._resolve(API_ATLAS_META);
-      await waitForQueued(apiHost, calls.atlasMsgs.url);
+      calls.atlasMsgs._resolve(API_ATLAS_MSGS);
       calls.beaconMsgs._resolve(API_BEACON_MSGS);
     }
-
-    calls.atlasMsgs._resolve(API_ATLAS_MSGS);
     await Promise.all([first, second]);
 
     return {
@@ -523,24 +516,21 @@ async function runStaleRejectedIdleCatch() {
   S.session = { session_id: 'sid-atlas', message_count: 0 };
 
   const calls = {
-    firstMeta: apiHost.enqueue(buildMessageUrl('sid-atlas', 0)),
     firstMsgs: apiHost.enqueue(buildMessageUrl('sid-atlas', 1)),
-    secondMeta: apiHost.enqueue(buildMessageUrl('sid-atlas', 0)),
     secondMsgs: apiHost.enqueue(buildMessageUrl('sid-atlas', 1)),
   };
 
   const first = loadSession('sid-atlas', { force: true });
-  calls.firstMeta._resolve(API_ATLAS_META);
 
-  // Ensure the first load has entered the messages fetch and owns the pending API
-  // call before the superseding same-session load begins.
+  // Ensure the first load owns the pending full-session request before the
+  // superseding same-session load begins.
   await waitForQueued(apiHost, calls.firstMsgs.url);
 
   const second = loadSession('sid-atlas', { force: true });
+  await waitForQueued(apiHost, calls.secondMsgs.url);
 
   // The stale first request rejects while the second newer request is in flight.
   calls.firstMsgs._reject(new Error('owner lost while load was in-flight'));
-  calls.secondMeta._resolve(API_ATLAS_RELOAD_META);
   calls.secondMsgs._resolve(API_ATLAS_RELOAD_MSGS);
 
   await Promise.all([first, second]);
@@ -630,18 +620,10 @@ def test_loadsession_cross_session_ordering_and_stale_reject_behavior(tmp_path):
         )
 
     # 1) Cross-session ordering: old (Beacon) loads first, but user advances to Atlas.
-    assert cross["apiCalls"][0] == "/api/session?session_id=sid-beacon&messages=0&resolve_model=0", (
-        "first API call should target old session's metadata"
-    )
-    assert cross["apiCalls"][1] == "/api/session?session_id=sid-beacon&messages=1&resolve_model=0&msg_limit=2&expand_renderable=1", (
-        "beacon transcript request should queue before atlas metadata resolves"
-    )
-    assert cross["apiCalls"][2] == "/api/session?session_id=sid-atlas&messages=0&resolve_model=0", (
-        "second API call should target atlas metadata while stale beacon messages are in flight"
-    )
-    assert cross["apiCalls"][3] == "/api/session?session_id=sid-atlas&messages=1&resolve_model=0&msg_limit=2&expand_renderable=1", (
-        "atlas should still fetch a transcript while beacon was stale"
-    )
+    assert cross["apiCalls"] == [
+        "/api/session?session_id=sid-beacon&messages=1&resolve_model=0&msg_limit=2&expand_renderable=1",
+        "/api/session?session_id=sid-atlas&messages=1&resolve_model=0&msg_limit=2&expand_renderable=1",
+    ], "each overlapping switch should issue exactly one bounded full-session request"
     assert cross["apiCalls"].count("/api/session?session_id=sid-beacon&messages=1&resolve_model=0&msg_limit=2&expand_renderable=1") == 1, (
         "stale overlap should still issue the Beacon transcript call, but it must not win"
     )
@@ -649,18 +631,10 @@ def test_loadsession_cross_session_ordering_and_stale_reject_behavior(tmp_path):
 
     # 2) Observed idle-path race with no INFLIGHT: stale Beacon transcript returns
     #    before Atlas metadata, but ownership guard must still force Atlas fetch+swap.
-    assert observed["apiCalls"][0] == "/api/session?session_id=sid-beacon&messages=0&resolve_model=0", (
-        "idle-path race should start from old Beacon metadata"
-    )
-    assert observed["apiCalls"][1] == "/api/session?session_id=sid-beacon&messages=1&resolve_model=0&msg_limit=2&expand_renderable=1", (
-        "Beacon transcript call should remain queued before Atlas metadata under observed race"
-    )
-    assert observed["apiCalls"][2] == "/api/session?session_id=sid-atlas&messages=0&resolve_model=0", (
-        "Atlas metadata must start while Beacon continuation returns stale"
-    )
-    assert observed["apiCalls"][3] == "/api/session?session_id=sid-atlas&messages=1&resolve_model=0&msg_limit=2&expand_renderable=1", (
-        "Atlas transcript request must still issue despite stale Beacon return"
-    )
+    assert observed["apiCalls"] == [
+        "/api/session?session_id=sid-beacon&messages=1&resolve_model=0&msg_limit=2&expand_renderable=1",
+        "/api/session?session_id=sid-atlas&messages=1&resolve_model=0&msg_limit=2&expand_renderable=1",
+    ], "idle overlap should preserve one request per switch"
     assert observed["apiCalls"].count("/api/session?session_id=sid-beacon&messages=1&resolve_model=0&msg_limit=2&expand_renderable=1") == 1, (
         "stale Beacon transcript should occur once in observed race"
     )

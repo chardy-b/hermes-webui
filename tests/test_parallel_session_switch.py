@@ -434,17 +434,17 @@ class TestMessagePaginationFrontend:
     """Frontend sessions.js must use msg_limit for initial load and expose
     _loadOlderMessages for scroll-to-top lazy loading."""
 
-    def test_ensure_messages_uses_msg_limit(self):
-        """_ensureMessagesLoaded must send msg_limit parameter."""
-        fn_start = SESSIONS_JS.find("async function _ensureMessagesLoaded")
+    def test_initial_session_request_uses_msg_limit(self):
+        """The shared initial-load URL must send a bounded msg_limit."""
+        fn_start = SESSIONS_JS.find("function _sessionMessagesRequestUrl")
         fn_end = SESSIONS_JS.find("\n}", fn_start) + 2
         fn_body = SESSIONS_JS[fn_start:fn_end]
 
         assert "msg_limit=" in fn_body, (
-            "_ensureMessagesLoaded should include msg_limit parameter in the API call"
+            "the initial session request should include msg_limit"
         )
-        assert "_INITIAL_MSG_LIMIT" in fn_body, (
-            "_ensureMessagesLoaded should use _INITIAL_MSG_LIMIT constant"
+        assert "_messageReloadLimitForSession" in fn_body, (
+            "the shared request should preserve the initial/reload window policy"
         )
 
     def test_truncation_tracking(self):
